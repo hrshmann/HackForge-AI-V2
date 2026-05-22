@@ -1,0 +1,13 @@
+streamlit
+plotly
+aiohttp
+beautifulsoup4
+requests
+lxml
+pandas
+numpy
+scikit-learn
+joblib
+python-docx
+reportlab
+tldextract

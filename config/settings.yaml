@@ -1,0 +1,15 @@
+scanner:
+  max_crawl_depth: 3
+  max_pages: 50
+  timeout: 30
+
+ml_model:
+  confidence_threshold: 0.7
+  device: "cuda"
+
+tools:
+  sqlmap:
+    level: 2
+    risk: 1
+  xsstrike:
+    timeout: 180
