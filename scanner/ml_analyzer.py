@@ -1,7 +1,8 @@
-import joblib
 from pathlib import Path
 from typing import Dict
 from collections import defaultdict
+import warnings
+from model_loader import load_joblib_model
 
 
 class MLVulnerabilityAnalyzer:
@@ -18,7 +19,7 @@ class MLVulnerabilityAnalyzer:
         for path in possible_paths:
             path = Path(path)
             if path.exists():
-                return joblib.load(path)
+                return load_joblib_model(str(path))
 
         raise FileNotFoundError("web_vuln_ml_model.pkl not found inside models folder")
 
@@ -32,7 +33,9 @@ class MLVulnerabilityAnalyzer:
         return dict(predictions)
 
     def _predict_vector(self, features):
-        prob_sets = self.model.predict_proba([features])
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
+            prob_sets = self.model.predict_proba([features])
 
         probs = []
         for prob in prob_sets:

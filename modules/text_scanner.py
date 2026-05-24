@@ -1,14 +1,24 @@
 import re
 import math
-import joblib
+import os
+import nltk
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer
+from model_loader import load_joblib_model
 
-model = joblib.load("models/text_threat_model.pkl")
-vectorizer = joblib.load("models/text_vectorizer.pkl")
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+
+model = load_joblib_model(os.path.join(MODEL_DIR, "text_threat_model.pkl"))
+vectorizer = load_joblib_model(os.path.join(MODEL_DIR, "text_vectorizer.pkl"))
 
 stemmer = PorterStemmer()
-stop_words = set(stopwords.words('english'))
+
+try:
+    stop_words = set(stopwords.words("english"))
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+    stop_words = set(stopwords.words("english"))
 
 def preprocess_text(text):
     text = str(text)

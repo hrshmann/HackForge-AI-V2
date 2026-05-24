@@ -11,10 +11,45 @@ import streamlit as st
 
 
 # ==============================
+# Streamlit Setup
+# ==============================
+
+st.set_page_config(
+    page_title="HackForge AI",
+    page_icon="HF",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ==============================
+# ML Asset Setup
+# ==============================
+
+MODEL_SETUP_STATUS: Dict[str, str] = {}
+MODEL_SETUP_ERROR: Optional[str] = None
+
+try:
+    from model_loader import setup_models
+
+    @st.cache_resource(show_spinner=False)
+    def initialize_models() -> Dict[str, str]:
+        return setup_models()
+
+    with st.spinner("Preparing ML models..."):
+        MODEL_SETUP_STATUS = initialize_models()
+except Exception as exc:
+    MODEL_SETUP_ERROR = str(exc)
+
+
+# ==============================
 # Real Backend Imports
 # ==============================
 
 BACKEND_IMPORT_ERRORS: Dict[str, str] = {}
+
+if MODEL_SETUP_ERROR:
+    BACKEND_IMPORT_ERRORS["Model setup"] = MODEL_SETUP_ERROR
 
 try:
     from scanner.scanner import run_scan
@@ -70,18 +105,6 @@ PAGES = {
     "analytics": "Analytics",
     "reference": "Coverage Reference",
 }
-
-
-# ==============================
-# Streamlit Setup
-# ==============================
-
-st.set_page_config(
-    page_title="HackForge AI",
-    page_icon="HF",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 
 def get_query_page() -> Optional[str]:
