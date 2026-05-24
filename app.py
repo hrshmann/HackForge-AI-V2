@@ -3,7 +3,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import plotly.graph_objects as go
@@ -995,6 +995,28 @@ div[data-testid="stExpander"] {
     border: 1px solid rgba(49,245,143,0.28);
 }
 
+.status-pill {
+    border-radius: 999px;
+    padding: 0.42rem 0.72rem;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.status-confirmed {
+    color: #c9fff0;
+    background: rgba(49,245,143,0.12);
+    border: 1px solid rgba(49,245,143,0.3);
+}
+
+.status-review {
+    color: #fff3bc;
+    background: rgba(247,201,72,0.15);
+    border: 1px solid rgba(247,201,72,0.34);
+}
+
 .report-brief {
     padding: 1.3rem;
     border-radius: 20px;
@@ -1039,6 +1061,14 @@ div[data-testid="stExpander"] {
     color: #f3f9ff;
     font-size: 1rem;
     font-weight: 900;
+}
+
+.finding-badges {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 
 .finding-meta {
@@ -1249,6 +1279,25 @@ def severity_class(severity: str) -> str:
     return f"sev-{sev}"
 
 
+def is_ml_suspected_finding(finding: Dict[str, Any]) -> bool:
+    title = safe_text(finding.get("vulnerability_type") or finding.get("title"), "").lower()
+    source = safe_text(finding.get("source"), "").lower()
+    status = safe_text(finding.get("validation_status"), "").lower()
+    cwe = safe_text(finding.get("cwe"), "").lower()
+    return (
+        "ml suspected" in title
+        or source == "ml_prediction"
+        or status == "needs_review"
+        or cwe == "heuristic-ml"
+    )
+
+
+def finding_review_label(finding: Dict[str, Any]) -> Tuple[str, str]:
+    if is_ml_suspected_finding(finding):
+        return "Needs Review", "status-review"
+    return "Confirmed", "status-confirmed"
+
+
 def severity_counts(findings: List[Dict[str, Any]]) -> Dict[str, int]:
     counts = Counter(safe_text(f.get("severity"), "low").lower() for f in findings)
     return {
@@ -1306,13 +1355,15 @@ def build_web_ai_overview(scan_data: Dict[str, Any], report: Optional[Dict[str, 
             return summary
 
     findings = scan_data.get("validated_results", [])
+    review_count = sum(1 for item in findings if is_ml_suspected_finding(item))
+    confirmed_count = max(0, len(findings) - review_count)
     risk = scan_data.get("risk_assessment", {})
     risk_level = safe_text(risk.get("risk_level"), "unknown").upper()
     risk_score = risk.get("risk_score", 0)
     return (
         f"HackForge AI completed the assessment with a {risk_level} exposure profile "
-        f"and a risk score of {risk_score}/100 across {len(findings)} validated findings. "
-        "Prioritize confirmed exploit paths, high-confidence misconfigurations, and remediation tasks by severity."
+        f"and a risk score of {risk_score}/100 across {len(findings)} reported findings. "
+        f"{confirmed_count} are confirmed by active checks or scanner rules, and {review_count} are ML leads that need review."
     )
 
 
@@ -1353,8 +1404,8 @@ def explain_finding_for_reader(finding: Dict[str, Any]) -> str:
             "It may not be an immediate exploit, but it should be checked and fixed if it affects a real user path."
         )
 
-    if "ml suspected" in lowered:
-        base += " Because this is marked as ML suspected, treat it as a strong lead and confirm it manually before calling it fully proven."
+    if is_ml_suspected_finding(finding):
+        base += " This is an ML lead, not a proven exploit. Treat it as something to review before calling it a confirmed vulnerability."
 
     return f"{base} Current severity is {severity}, and scanner confidence is {confidence}%."
 
@@ -2002,6 +2053,8 @@ def render_empty_results() -> None:
 def render_web_results(data: Dict[str, Any]) -> None:
     risk = data.get("risk_assessment", {})
     findings = data.get("validated_results", []) or []
+    review_count = sum(1 for item in findings if is_ml_suspected_finding(item))
+    confirmed_count = max(0, len(findings) - review_count)
     crawl = data.get("crawl_summary", {}) or {}
     report = data.get("report") or {}
     recommendations = report.get("recommendations", []) if report else []
@@ -2043,6 +2096,8 @@ def render_web_results(data: Dict[str, Any]) -> None:
                 <div class="detail-tile"><span>Pages</span><strong>{crawl.get('pages_discovered', 0)}</strong></div>
                 <div class="detail-tile"><span>Forms</span><strong>{crawl.get('forms_discovered', 0)}</strong></div>
                 <div class="detail-tile"><span>CWE Coverage</span><strong>{esc(', '.join(cwes[:4]) if cwes else 'N/A')}</strong></div>
+                <div class="detail-tile"><span>Confirmed</span><strong>{confirmed_count}</strong></div>
+                <div class="detail-tile"><span>Needs Review</span><strong>{review_count}</strong></div>
             </div>
         </div>
         """,
@@ -2050,10 +2105,10 @@ def render_web_results(data: Dict[str, Any]) -> None:
     )
 
     st.write("")
-    st.markdown('<div class="section-kicker">Validated Findings</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-kicker">Findings Review</div>', unsafe_allow_html=True)
 
     if not findings:
-        st.success("No validated findings were returned by the web vulnerability engine.")
+        st.success("No findings were returned by the web vulnerability engine.")
     else:
         for idx, finding in enumerate(findings, start=1):
             title = finding.get("vulnerability_type") or finding.get("title") or f"Finding {idx}"
@@ -2062,6 +2117,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
             url = finding.get("url", "site-wide")
             cvss = finding.get("cvss_score", "N/A")
             cwe = finding.get("cwe", "N/A")
+            review_label, review_class = finding_review_label(finding)
             details = finding.get("details", {})
             remediation = finding.get("remediation", {})
             reader_explanation = explain_finding_for_reader(finding)
@@ -2072,7 +2128,10 @@ def render_web_results(data: Dict[str, Any]) -> None:
                 <div class="finding-card">
                     <div class="finding-head">
                         <h4>{idx:02d}. {esc(title)}</h4>
-                        <span class="severity-pill {severity_class(severity)}">{esc(severity)}</span>
+                        <div class="finding-badges">
+                            <span class="status-pill {review_class}">{esc(review_label)}</span>
+                            <span class="severity-pill {severity_class(severity)}">{esc(severity)}</span>
+                        </div>
                     </div>
                     <div class="finding-meta">{esc(url)}</div>
                     <div style="height:0.75rem;"></div>
@@ -2081,6 +2140,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
                         <div class="detail-tile"><span>Confidence</span><strong>{confidence}%</strong></div>
                         <div class="detail-tile"><span>CVSS</span><strong>{esc(cvss)}</strong></div>
                         <div class="detail-tile"><span>CWE</span><strong>{esc(cwe)}</strong></div>
+                        <div class="detail-tile"><span>Review Status</span><strong>{esc(review_label)}</strong></div>
                     </div>
                 </div>
                 """,
@@ -2114,7 +2174,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
     else:
         st.markdown(
             '<div class="indicator-grid">'
-            '<div class="indicator-card"><strong>Patch confirmed exploit paths</strong><span>Prioritize vulnerabilities with the highest severity, CVSS score, and confidence.</span></div>'
+            '<div class="indicator-card"><strong>Review strongest findings</strong><span>Confirm ML leads before calling them exploitable, then prioritize by severity and confidence.</span></div>'
             '<div class="indicator-card"><strong>Harden exposed surfaces</strong><span>Apply secure defaults, HTTP security headers, and input validation across affected endpoints.</span></div>'
             '<div class="indicator-card"><strong>Retest after remediation</strong><span>Run a fresh assessment after fixes to confirm exposure reduction.</span></div>'
             '</div>',

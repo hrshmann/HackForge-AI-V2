@@ -49,8 +49,10 @@ class HackForgeScanner:
         merged = []
         active_keys = {(f.get('vulnerability_type'), f.get('url')) for f in active_results}
 
-        # confirmed active findings first
+        # confirmed active/rule-based findings first
         for finding in active_results:
+            finding.setdefault('source', 'active_validation')
+            finding.setdefault('validation_status', 'confirmed')
             merged.append(finding)
 
         # bring in strongest ML suspects (controlled amount)
@@ -72,8 +74,10 @@ class HackForgeScanner:
                         'url': url,
                         'severity': 'low' if conf < 0.70 else 'medium',
                         'confidence': round(conf, 2),
+                        'source': 'ml_prediction',
+                        'validation_status': 'needs_review',
                         'details': {
-                            'reason': 'Heuristic anomaly detected by ML engine'
+                            'reason': 'The ML model flagged this pattern for review. It has not been actively confirmed as an exploitable vulnerability.'
                         },
                         'cvss_score': 3.8 if conf < 0.70 else 5.2,
                         'cwe': 'Heuristic-ML'

@@ -39,8 +39,12 @@ class MLVulnerabilityAnalyzer:
 
         probs = []
         for prob in prob_sets:
-            if len(prob[0]) > 1:
-                probs.append(float(prob[0][1]))
+            row = list(prob[0]) if len(prob) else []
+            if len(row) > 1:
+                positive_row = [max(float(value), 0.0) for value in row]
+                total = sum(positive_row)
+                probability = positive_row[1] / total if total else 0.0
+                probs.append(max(0.0, min(1.0, probability)))
             else:
                 probs.append(0.0)
 
