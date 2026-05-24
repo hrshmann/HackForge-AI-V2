@@ -1078,6 +1078,16 @@ div[data-testid="stExpander"] {
     word-break: break-word;
 }
 
+.finding-note {
+    color: #d8e4f2;
+    border: 1px solid rgba(247,201,72,0.24);
+    background: rgba(247,201,72,0.08);
+    border-radius: 12px;
+    padding: 0.7rem 0.85rem;
+    margin: 0.75rem 0;
+    line-height: 1.55;
+}
+
 .confidence-track {
     width: 100%;
     height: 8px;
@@ -1294,8 +1304,22 @@ def is_ml_suspected_finding(finding: Dict[str, Any]) -> bool:
 
 def finding_review_label(finding: Dict[str, Any]) -> Tuple[str, str]:
     if is_ml_suspected_finding(finding):
-        return "Needs Review", "status-review"
+        return "Review Lead", "status-review"
     return "Confirmed", "status-confirmed"
+
+
+def display_finding_title(finding: Dict[str, Any], fallback: str) -> str:
+    raw_title = safe_text(finding.get("vulnerability_type") or finding.get("title"), fallback)
+    if is_ml_suspected_finding(finding):
+        cleaned = raw_title.replace("ML Suspected", "").strip()
+        return f"Review Lead: {cleaned or 'Security Finding'}"
+    return raw_title
+
+
+def finding_status_note(finding: Dict[str, Any]) -> str:
+    if is_ml_suspected_finding(finding):
+        return "This is not a confirmed vulnerability. The ML model noticed a pattern that should be reviewed with the evidence below."
+    return "This item was produced by an active scanner check or rule-based validation."
 
 
 def severity_counts(findings: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -1363,7 +1387,7 @@ def build_web_ai_overview(scan_data: Dict[str, Any], report: Optional[Dict[str, 
     return (
         f"HackForge AI completed the assessment with a {risk_level} exposure profile "
         f"and a risk score of {risk_score}/100 across {len(findings)} reported findings. "
-        f"{confirmed_count} are confirmed by active checks or scanner rules, and {review_count} are ML leads that need review."
+        f"{confirmed_count} are confirmed by active checks or scanner rules, and {review_count} are review leads from the ML model."
     )
 
 
@@ -1405,7 +1429,7 @@ def explain_finding_for_reader(finding: Dict[str, Any]) -> str:
         )
 
     if is_ml_suspected_finding(finding):
-        base += " This is an ML lead, not a proven exploit. Treat it as something to review before calling it a confirmed vulnerability."
+        base += " This is a review lead, not a proven exploit. Treat it as something to verify before calling it a confirmed vulnerability."
 
     return f"{base} Current severity is {severity}, and scanner confidence is {confidence}%."
 
@@ -2097,7 +2121,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
                 <div class="detail-tile"><span>Forms</span><strong>{crawl.get('forms_discovered', 0)}</strong></div>
                 <div class="detail-tile"><span>CWE Coverage</span><strong>{esc(', '.join(cwes[:4]) if cwes else 'N/A')}</strong></div>
                 <div class="detail-tile"><span>Confirmed</span><strong>{confirmed_count}</strong></div>
-                <div class="detail-tile"><span>Needs Review</span><strong>{review_count}</strong></div>
+                <div class="detail-tile"><span>Review Leads</span><strong>{review_count}</strong></div>
             </div>
         </div>
         """,
@@ -2111,13 +2135,14 @@ def render_web_results(data: Dict[str, Any]) -> None:
         st.success("No findings were returned by the web vulnerability engine.")
     else:
         for idx, finding in enumerate(findings, start=1):
-            title = finding.get("vulnerability_type") or finding.get("title") or f"Finding {idx}"
+            title = display_finding_title(finding, f"Finding {idx}")
             severity = safe_text(finding.get("severity"), "low").lower()
             confidence = normalize_confidence(finding.get("confidence", 0))
             url = finding.get("url", "site-wide")
             cvss = finding.get("cvss_score", "N/A")
             cwe = finding.get("cwe", "N/A")
             review_label, review_class = finding_review_label(finding)
+            status_note = finding_status_note(finding)
             details = finding.get("details", {})
             remediation = finding.get("remediation", {})
             reader_explanation = explain_finding_for_reader(finding)
@@ -2134,6 +2159,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
                         </div>
                     </div>
                     <div class="finding-meta">{esc(url)}</div>
+                    <div class="finding-note">{esc(status_note)}</div>
                     <div style="height:0.75rem;"></div>
                     <div class="confidence-track"><div class="confidence-fill" style="width:{confidence}%;"></div></div>
                     <div class="detail-grid">
@@ -2174,7 +2200,7 @@ def render_web_results(data: Dict[str, Any]) -> None:
     else:
         st.markdown(
             '<div class="indicator-grid">'
-            '<div class="indicator-card"><strong>Review strongest findings</strong><span>Confirm ML leads before calling them exploitable, then prioritize by severity and confidence.</span></div>'
+            '<div class="indicator-card"><strong>Review strongest findings</strong><span>Verify review leads before calling them exploitable, then prioritize by severity and confidence.</span></div>'
             '<div class="indicator-card"><strong>Harden exposed surfaces</strong><span>Apply secure defaults, HTTP security headers, and input validation across affected endpoints.</span></div>'
             '<div class="indicator-card"><strong>Retest after remediation</strong><span>Run a fresh assessment after fixes to confirm exposure reduction.</span></div>'
             '</div>',
