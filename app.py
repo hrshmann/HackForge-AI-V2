@@ -2,12 +2,27 @@ import html
 import json
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import plotly.graph_objects as go
+import requests
 import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_cookies_controller import CookieController
+try:
+    import firebase_admin
+    from firebase_admin import credentials, auth, firestore
+except Exception as exc:
+    firebase_admin = None
+    credentials = None
+    auth = None
+    firestore = None
+    FIREBASE_IMPORT_ERROR = str(exc)
+else:
+    FIREBASE_IMPORT_ERROR = None
 
 
 # ==============================
@@ -20,6 +35,27 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("auth_debug")
+
+cookie_controller = CookieController()
+
+def set_auth_user(user: Optional[Dict[str, Any]]) -> None:
+    logger.info(f"[set_auth_user] Modifying auth_user. Old: {st.session_state.get('auth_user')}, New: {user}")
+    st.session_state.auth_user = user
+    if user:
+        st.session_state.pending_cookie_user = json.dumps(user)
+    else:
+        st.session_state.pending_cookie_remove = "hf_auth_user"
+
+if "pending_cookie_user" in st.session_state:
+    cookie_controller.set("hf_auth_user", st.session_state.pending_cookie_user)
+    del st.session_state["pending_cookie_user"]
+elif "pending_cookie_remove" in st.session_state:
+    cookie_controller.remove("hf_auth_user")
+    del st.session_state["pending_cookie_remove"]
 
 
 # ==============================
@@ -95,6 +131,8 @@ except Exception as exc:
 
 
 APP_VERSION = "2.0.0"
+FIREBASE_AUTH_BASE_URL = "https://identitytoolkit.googleapis.com/v1"
+SCAN_HISTORY_COLLECTION = "scans"
 PAGES = {
     "home": "Home",
     "web": "Web Scan",
@@ -103,6 +141,7 @@ PAGES = {
     "url": "URL Check",
     "results": "Report",
     "analytics": "Analytics",
+    "history": "Scan History",
     "reference": "Coverage Reference",
 }
 
@@ -135,11 +174,16 @@ def set_query_page(page: str) -> None:
 
 
 def navigate(page: str) -> None:
+    logger.info(f"[navigate] Before navigation: auth_user={st.session_state.get('auth_user')}")
     st.session_state.page = page
-    set_query_page(page)
+    # ROOT CAUSE FIX: set_query_page(page) causes a session reset in this Streamlit environment.
+    # We disable it to prevent wiping st.session_state.auth_user when changing scanners.
+    # set_query_page(page)
+    logger.info(f"[navigate] After navigation: auth_user={st.session_state.get('auth_user')}")
 
 
 def init_state() -> None:
+    logger.info(f"[init_state] Start. session auth_user={st.session_state.get('auth_user')}")
     defaults = {
         "page": "home",
         "scan_results": None,
@@ -148,11 +192,26 @@ def init_state() -> None:
         "last_run_at": None,
         "selected_engine": "Home",
         "web_target": "",
+        "auth_user": None,
+        "auth_mode": "login",
+        "auth_notice": "",
+        "last_firestore_error": None,
+        "last_saved_scan_id": None,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    if st.session_state.auth_user is None:
+        cookie_user = cookie_controller.get("hf_auth_user")
+        logger.info(f"[init_state] session auth_user is None. Cookie retrieved: {cookie_user}")
+        if cookie_user:
+            try:
+                st.session_state.auth_user = json.loads(cookie_user) if isinstance(cookie_user, str) else cookie_user
+                logger.info(f"[init_state] Restored auth_user from cookie: {st.session_state.auth_user}")
+            except Exception as e:
+                logger.info(f"[init_state] Failed to load cookie: {e}")
 
     query_page = get_query_page()
     if query_page:
@@ -319,7 +378,8 @@ div[data-baseweb="input"] input {
 }
 
 .stButton > button,
-.stDownloadButton > button {
+.stDownloadButton > button,
+.stFormSubmitButton > button {
     width: 100%;
     min-height: 52px;
     border: 1px solid rgba(148, 170, 205, 0.18) !important;
@@ -334,7 +394,8 @@ div[data-baseweb="input"] input {
 }
 
 .stButton > button[kind="primary"],
-.stDownloadButton > button {
+.stDownloadButton > button,
+.stFormSubmitButton > button[kind="primary"] {
     border-color: rgba(49, 245, 143, 0.42) !important;
     background: linear-gradient(180deg, rgba(52, 255, 150, 1), rgba(21, 199, 101, 1)) !important;
     color: #03150a !important;
@@ -345,7 +406,8 @@ div[data-baseweb="input"] input {
 }
 
 .stButton > button:hover,
-.stDownloadButton > button:hover {
+.stDownloadButton > button:hover,
+.stFormSubmitButton > button:hover {
     transform: translateY(-1px);
     border-color: rgba(49,245,143,0.38) !important;
     filter: brightness(1.04);
@@ -353,7 +415,8 @@ div[data-baseweb="input"] input {
 }
 
 .stButton > button[kind="primary"]:hover,
-.stDownloadButton > button:hover {
+.stDownloadButton > button:hover,
+.stFormSubmitButton > button[kind="primary"]:hover {
     box-shadow: 0 0 38px rgba(49,245,143,0.34), inset 0 1px 0 rgba(255,255,255,0.42);
 }
 
@@ -373,7 +436,8 @@ section[data-testid="stSidebar"] .stButton > button:hover {
     box-shadow: 0 0 24px rgba(49,245,143,0.12);
 }
 
-.stButton > button:disabled {
+.stButton > button:disabled,
+.stFormSubmitButton > button:disabled {
     color: rgba(217,230,244,0.38) !important;
     background: rgba(13, 24, 38, 0.76) !important;
     border-color: rgba(148, 171, 205, 0.18) !important;
@@ -1372,6 +1436,501 @@ def extract_json_lines(data: Any) -> str:
         return safe_text(data)
 
 
+def plain_secret_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): plain_secret_value(value[key]) for key in value.keys()}
+    return value
+
+
+def streamlit_secrets() -> Dict[str, Any]:
+    try:
+        secrets = plain_secret_value(st.secrets)
+    except Exception:
+        return {}
+    return secrets if isinstance(secrets, dict) else {}
+
+
+def nested_secret(secrets: Dict[str, Any], *path: str) -> Any:
+    current: Any = secrets
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def firebase_api_key() -> Optional[str]:
+    secrets = streamlit_secrets()
+    candidates = [
+        secrets.get("firebase_api_key"),
+        secrets.get("FIREBASE_API_KEY"),
+        nested_secret(secrets, "firebase", "api_key"),
+        nested_secret(secrets, "firebase", "apiKey"),
+        nested_secret(secrets, "firebase", "web_api_key"),
+        nested_secret(secrets, "firebase_auth", "api_key"),
+    ]
+
+    for candidate in candidates:
+        value = str(candidate).strip() if candidate else ""
+        if value and value != "PASTE_FIREBASE_WEB_API_KEY_HERE":
+            return value
+    # Implemented Firebase Web API Key
+    return "AIzaSyDPNYYu72N2K26ged-4rrmGqrZUEML9AF8"
+
+
+def normalize_service_account(candidate: Any, secrets: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if isinstance(candidate, str):
+        try:
+            candidate = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+
+    if not isinstance(candidate, Mapping):
+        return None
+
+    if not candidate.get("private_key") or not candidate.get("client_email"):
+        return None
+
+    service_account_keys = {
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "auth_uri",
+        "token_uri",
+        "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+        "universe_domain",
+    }
+    info = {key: candidate[key] for key in service_account_keys if key in candidate}
+
+    if isinstance(info.get("private_key"), str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
+
+    info.setdefault("type", "service_account")
+    info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+
+    project_id = (
+        info.get("project_id")
+        or candidate.get("project_id")
+        or secrets.get("firebase_project_id")
+        or nested_secret(secrets, "firebase", "project_id")
+    )
+    if project_id:
+        info["project_id"] = str(project_id)
+
+    return info
+
+
+def firebase_service_account_info() -> Optional[Dict[str, Any]]:
+    secrets = streamlit_secrets()
+    candidates = [
+        secrets.get("firebase_service_account"),
+        secrets.get("firebase_admin"),
+        secrets.get("gcp_service_account"),
+        nested_secret(secrets, "firebase", "service_account"),
+        nested_secret(secrets, "firebase", "admin"),
+        nested_secret(secrets, "connections", "firestore"),
+        secrets.get("firebase"),
+        secrets,
+    ]
+
+    for candidate in candidates:
+        info = normalize_service_account(candidate, secrets)
+        if info:
+            return info
+    return None
+
+
+@st.cache_resource(show_spinner=False)
+def get_firestore_client():
+    if FIREBASE_IMPORT_ERROR or firebase_admin is None or credentials is None or firestore is None:
+        raise RuntimeError(f"Firebase Admin SDK is unavailable: {FIREBASE_IMPORT_ERROR}")
+
+    service_account = firebase_service_account_info()
+    if not service_account:
+        raise RuntimeError(
+            "Add Firebase Admin SDK service account credentials to Streamlit secrets."
+        )
+
+    # IMPLEMENTED: Firestore initialization and connection
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(credentials.Certificate(service_account))
+    return firestore.client()
+
+
+class FirebaseAuthError(RuntimeError):
+    pass
+
+
+def friendly_firebase_error(message: str) -> str:
+    code = safe_text(message, "UNKNOWN_ERROR").split(" : ")[0]
+    messages = {
+        "EMAIL_EXISTS": "An account already exists for that email.",
+        "EMAIL_NOT_FOUND": "No account was found for that email.",
+        "INVALID_EMAIL": "Enter a valid email address.",
+        "INVALID_LOGIN_CREDENTIALS": "The email or password is incorrect.",
+        "INVALID_PASSWORD": "The email or password is incorrect.",
+        "MISSING_PASSWORD": "Enter your password.",
+        "OPERATION_NOT_ALLOWED": "Email/password sign-in is not enabled for this Firebase project.",
+        "TOO_MANY_ATTEMPTS_TRY_LATER": "Firebase temporarily blocked this action after too many attempts. Try again later.",
+        "WEAK_PASSWORD": "Use a stronger password with at least 6 characters.",
+    }
+    return messages.get(code, code.replace("_", " ").title())
+
+
+def firebase_auth_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    api_key = firebase_api_key()
+    if not api_key:
+        raise RuntimeError("Add your Firebase Web API key to Streamlit secrets as firebase_api_key.")
+
+    url = f"{FIREBASE_AUTH_BASE_URL}/{action}?key={api_key}"
+    response = requests.post(url, json=payload, timeout=30)
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    if response.status_code >= 400:
+        raw_message = nested_secret(data, "error", "message") or response.text
+        raise FirebaseAuthError(friendly_firebase_error(raw_message))
+
+    return data
+
+
+def auth_user_from_response(data: Dict[str, Any], fallback_email: str) -> Dict[str, Any]:
+    expires_in = data.get("expiresIn", 3600)
+    try:
+        expires_at = time.time() + int(expires_in)
+    except (TypeError, ValueError):
+        expires_at = time.time() + 3600
+
+    return {
+        "uid": data.get("localId"),
+        "email": data.get("email") or fallback_email,
+        "id_token": data.get("idToken"),
+        "refresh_token": data.get("refreshToken"),
+        "expires_at": expires_at,
+    }
+
+
+def sign_in_with_email_password(email: str, password: str) -> Dict[str, Any]:
+    data = firebase_auth_request(
+        "accounts:signInWithPassword",
+        {
+            "email": email.strip(),
+            "password": password,
+            "returnSecureToken": True,
+        },
+    )
+    return auth_user_from_response(data, email)
+
+
+def sign_up_with_email_password(email: str, password: str) -> Dict[str, Any]:
+    data = firebase_auth_request(
+        "accounts:signUp",
+        {
+            "email": email.strip(),
+            "password": password,
+            "returnSecureToken": True,
+        },
+    )
+    return auth_user_from_response(data, email)
+
+
+def send_password_reset(email: str) -> None:
+    try:
+        firebase_auth_request(
+            "accounts:sendOobCode",
+            {
+                "requestType": "PASSWORD_RESET",
+                "email": email.strip(),
+            },
+        )
+    except FirebaseAuthError as exc:
+        if "No account was found" not in str(exc):
+            raise
+
+
+def authenticated_user() -> Optional[Dict[str, Any]]:
+    user = st.session_state.get("auth_user")
+    if isinstance(user, dict) and user.get("uid"):
+        return user
+    return None
+
+
+def is_authenticated() -> bool:
+    return authenticated_user() is not None
+
+
+def clear_scan_state() -> None:
+    st.session_state.scan_results = None
+    st.session_state.threat_results = None
+    st.session_state.last_result_type = None
+    st.session_state.last_run_at = None
+    st.session_state.last_firestore_error = None
+    st.session_state.last_saved_scan_id = None
+
+
+def logout() -> None:
+    set_auth_user(None)
+    st.session_state.auth_mode = "login"
+    st.session_state.auth_notice = "Signed out successfully."
+    clear_scan_state()
+    navigate("home")
+
+
+def firebase_setup_warnings() -> List[str]:
+    warnings: List[str] = []
+    if FIREBASE_IMPORT_ERROR:
+        warnings.append(f"Firebase Admin SDK is not available: {FIREBASE_IMPORT_ERROR}")
+    if not firebase_api_key():
+        warnings.append("Firebase Web API key is missing from Streamlit secrets.")
+    if not firebase_service_account_info():
+        warnings.append("Firebase Admin SDK service account credentials are missing from Streamlit secrets.")
+    return warnings
+
+
+def scan_artifact(result: Dict[str, Any]) -> str:
+    if result.get("scan_type") == "web":
+        return safe_text(result.get("target_url"), "Unknown target")
+    return safe_text(result.get("submitted"), "Submitted content unavailable")
+
+
+def scan_verdict(result: Dict[str, Any]) -> str:
+    if result.get("scan_type") == "web":
+        risk = result.get("risk_assessment", {}) or {}
+        return f"{safe_text(risk.get('risk_level'), 'unknown').title()} Risk"
+
+    threat_result = result.get("result", {}) or {}
+    return safe_text(threat_result.get("status"), "Unknown")
+
+
+def scan_risk_score(result: Dict[str, Any]) -> float:
+    if result.get("scan_type") == "web":
+        risk = result.get("risk_assessment", {}) or {}
+        try:
+            return round(float(risk.get("risk_score", 0) or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
+
+    threat_result = result.get("result", {}) or {}
+    confidence = normalize_confidence(threat_result.get("confidence", 0))
+    status = safe_text(threat_result.get("status"), "").lower()
+    if result.get("scan_type") == "threat_text" and "legitimate" in status:
+        return round(max(0.0, 100.0 - confidence), 1)
+    return round(confidence, 1)
+
+
+def build_web_report_text(data: Dict[str, Any]) -> str:
+    risk = data.get("risk_assessment", {}) or {}
+    findings = data.get("validated_results", []) or []
+    report = data.get("report") or {}
+    recommendations = report.get("recommendations", []) if report else []
+    overview = data.get("ai_overview") or build_web_ai_overview(data, report)
+
+    lines = [
+        "HACKFORGE AI WEB SECURITY REPORT",
+        "=" * 40,
+        f"Target: {scan_artifact(data)}",
+        f"Scan date: {safe_text(data.get('started_at'))}",
+        f"Scan ID: {safe_text(data.get('scan_id'))}",
+        f"Risk score: {scan_risk_score(data)}/100",
+        f"Verdict: {scan_verdict(data)}",
+        f"Duration: {safe_text(data.get('duration'), '0')} seconds",
+        "",
+        "Executive summary",
+        "-" * 20,
+        safe_text(overview),
+        "",
+        "Finding summary",
+        "-" * 15,
+        f"Critical: {risk.get('critical_count', 0)}",
+        f"High: {risk.get('high_count', 0)}",
+        f"Medium: {risk.get('medium_count', 0)}",
+        f"Low: {risk.get('low_count', 0)}",
+        f"Total findings: {len(findings)}",
+        "",
+        "Findings",
+        "-" * 8,
+    ]
+
+    if not findings:
+        lines.append("No findings were returned by the web vulnerability engine.")
+    else:
+        for idx, finding in enumerate(findings, start=1):
+            title = display_finding_title(finding, f"Finding {idx}")
+            confidence = normalize_confidence(finding.get("confidence", 0))
+            evidence_points = summarize_finding_details(finding.get("details", {}))
+            remediation = finding.get("remediation", {})
+            remediation_text = ""
+            if isinstance(remediation, Mapping):
+                remediation_text = safe_text(remediation.get("summary"), "")
+            elif remediation:
+                remediation_text = safe_text(remediation, "")
+
+            lines.extend(
+                [
+                    f"{idx}. {title}",
+                    f"   Severity: {safe_text(finding.get('severity'), 'low')}",
+                    f"   URL: {safe_text(finding.get('url'), 'site-wide')}",
+                    f"   Confidence: {confidence}%",
+                    f"   CWE: {safe_text(finding.get('cwe'), 'N/A')}",
+                    f"   Explanation: {explain_finding_for_reader(finding)}",
+                ]
+            )
+            if evidence_points:
+                lines.append(f"   Evidence: {'; '.join(evidence_points)}")
+            if remediation_text:
+                lines.append(f"   Suggested fix: {remediation_text}")
+            lines.append("")
+
+    lines.extend(["", "Recommendations", "-" * 15])
+    if recommendations:
+        for rec in recommendations[:6]:
+            lines.append(f"- {safe_text(rec.get('title'))}: {safe_text(rec.get('description'))}")
+    else:
+        lines.extend(
+            [
+                "- Review strongest findings and verify review leads before treating them as exploitable.",
+                "- Harden exposed surfaces with secure defaults, HTTP security headers, and input validation.",
+                "- Retest after remediation to confirm exposure reduction.",
+            ]
+        )
+
+    return "\n".join(lines).strip()
+
+
+def build_threat_report_text(data: Dict[str, Any]) -> str:
+    threat_result = data.get("result", {}) or {}
+    indicators = data.get("indicators", []) or []
+    actions = data.get("actions", []) or []
+    artifact_label = "Submitted URL" if data.get("scan_type") == "threat_url" else "Submitted content"
+
+    lines = [
+        "HACKFORGE AI THREAT CHECK REPORT",
+        "=" * 38,
+        f"Analyzer: {safe_text(data.get('label'), 'Threat Intel')}",
+        f"Scan date: {safe_text(data.get('started_at'))}",
+        f"Scan type: {safe_text(data.get('scan_type'))}",
+        f"Risk score: {scan_risk_score(data)}/100",
+        f"Verdict: {scan_verdict(data)}",
+        f"Classifier confidence: {normalize_confidence(threat_result.get('confidence', 0))}%",
+        "",
+        artifact_label,
+        "-" * len(artifact_label),
+        scan_artifact(data),
+        "",
+        "Advisory summary",
+        "-" * 16,
+        safe_text(data.get("ai"), "No advisory generated."),
+        "",
+        "Triggered indicators",
+        "-" * 20,
+    ]
+
+    if indicators:
+        lines.extend(f"- {safe_text(indicator)}" for indicator in indicators)
+    else:
+        lines.append("No explicit risk indicators were returned by the analyzer.")
+
+    lines.extend(["", "Recommended response", "-" * 20])
+    if actions:
+        lines.extend(f"- {safe_text(action)}" for action in actions)
+    else:
+        lines.append("No response recommendations were returned by the analyzer.")
+
+    return "\n".join(lines).strip()
+
+
+def build_scan_report_text(result: Dict[str, Any]) -> str:
+    if result.get("scan_type") == "web":
+        return build_web_report_text(result)
+    return build_threat_report_text(result)
+
+
+def report_filename(result: Dict[str, Any]) -> str:
+    scan_type = safe_text(result.get("scan_type"), "scan").replace("_", "-")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"hackforge-{scan_type}-{stamp}.txt"
+
+
+def save_completed_scan(result: Dict[str, Any]) -> str:
+    user = authenticated_user()
+    if not user:
+        raise RuntimeError("Sign in before saving scan history.")
+
+    db = get_firestore_client()
+    now = datetime.now(timezone.utc)
+    scan_type = safe_text(result.get("scan_type"), "unknown")
+    artifact = scan_artifact(result)
+    report_text = build_scan_report_text(result)
+
+    # IMPLEMENTED: Save completed scans to Firestore
+    document = {
+        "user_uid": user["uid"],
+        "user_email": user.get("email", ""),
+        "scanned_url_or_content": artifact,
+        "scanned_url": artifact if scan_type == "web" else None,
+        "scanned_content": artifact if scan_type != "web" else None,
+        "scan_type": scan_type,
+        "risk_score": scan_risk_score(result),
+        "verdict": scan_verdict(result),
+        "report_text": report_text,
+        "timestamp": firestore.SERVER_TIMESTAMP,
+        "created_at": now.isoformat(timespec="seconds"),
+        "created_at_epoch": time.time(),
+    }
+    _, doc_ref = db.collection(SCAN_HISTORY_COLLECTION).add(document)
+    return doc_ref.id
+
+
+def persist_scan_or_remember_error(result: Dict[str, Any]) -> None:
+    st.session_state.last_firestore_error = None
+    st.session_state.last_saved_scan_id = None
+    try:
+        st.session_state.last_saved_scan_id = save_completed_scan(result)
+    except Exception as exc:
+        st.session_state.last_firestore_error = str(exc)
+
+
+def load_user_scan_history(user_uid: str, limit: int = 50) -> List[Dict[str, Any]]:
+    db = get_firestore_client()
+    collection = db.collection(SCAN_HISTORY_COLLECTION)
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        query = collection.where(filter=FieldFilter("user_uid", "==", user_uid))
+    except Exception:
+        query = collection.where("user_uid", "==", user_uid)
+    docs = query.stream()
+
+    records: List[Dict[str, Any]] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        data["id"] = doc.id
+        records.append(data)
+
+    records.sort(key=lambda item: float(item.get("created_at_epoch", 0) or 0), reverse=True)
+    return records[:limit]
+
+
+def format_history_timestamp(record: Dict[str, Any]) -> str:
+    created_at = record.get("created_at")
+    if created_at:
+        return safe_text(created_at)
+
+    timestamp = record.get("timestamp")
+    if hasattr(timestamp, "astimezone"):
+        try:
+            return timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            pass
+    return safe_text(timestamp, "Timestamp unavailable")
+
+
 def build_web_ai_overview(scan_data: Dict[str, Any], report: Optional[Dict[str, Any]]) -> str:
     if report:
         summary = report.get("executive_summary", {}).get("summary")
@@ -1603,6 +2162,7 @@ def run_url_assessment(url: str) -> Dict[str, Any]:
 
 
 def store_web_result(result: Dict[str, Any]) -> None:
+    persist_scan_or_remember_error(result)
     st.session_state.scan_results = result
     st.session_state.threat_results = None
     st.session_state.last_result_type = "web"
@@ -1611,6 +2171,7 @@ def store_web_result(result: Dict[str, Any]) -> None:
 
 
 def store_threat_result(result: Dict[str, Any]) -> None:
+    persist_scan_or_remember_error(result)
     st.session_state.threat_results = result
     st.session_state.scan_results = None
     st.session_state.last_result_type = "threat"
@@ -1670,8 +2231,13 @@ def create_risk_gauge(value: float, title: str) -> go.Figure:
 
 def render_topbar() -> None:
     backend_online = len(BACKEND_IMPORT_ERRORS) == 0
+    user = authenticated_user()
     status_text = "Ready to scan" if backend_online else "Setup needs attention"
     dot_class = "hf-dot" if backend_online else "hf-dot warn"
+    if user:
+        status_text = f"Signed in as {safe_text(user.get('email'))}"
+    elif backend_online:
+        status_text = "Sign in required"
     st.markdown(
         f"""
         <div class="hf-shell hf-topbar">
@@ -1697,6 +2263,7 @@ def render_main_navigation() -> None:
         ("URL Check", "url"),
         ("Report", "results"),
         ("Analytics", "analytics"),
+        ("History", "history"),
     ]
     cols = st.columns(len(labels), gap="small")
     for col, (label, page) in zip(cols, labels):
@@ -1718,6 +2285,7 @@ def sidebar_button(label: str, page: str) -> None:
 
 def render_sidebar() -> None:
     with st.sidebar:
+        user = authenticated_user()
         selected_engine = PAGES.get(st.session_state.page, "Home")
         last_run = st.session_state.last_run_at or "No report yet"
         project_status = "Ready" if not BACKEND_IMPORT_ERRORS else "Needs setup"
@@ -1745,7 +2313,34 @@ def render_sidebar() -> None:
             unsafe_allow_html=True,
         )
 
-        if st.session_state.page == "web":
+        if user:
+            uid_label = safe_text(user.get("uid"))
+            if len(uid_label) > 18:
+                uid_label = f"{uid_label[:15]}..."
+            st.markdown(
+                f"""
+                <div class="sidebar-card" style="margin-top:0.9rem;">
+                    <div class="micro-label">Account</div>
+                    <div class="side-row"><span>Email</span><strong>{esc(user.get('email'))}</strong></div>
+                    <div class="side-row"><span>UID</span><strong>{esc(uid_label)}</strong></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.button("Logout", on_click=logout, use_container_width=True)
+        else:
+            st.markdown(
+                """
+                <div class="sidebar-card" style="margin-top:0.9rem;">
+                    <div class="micro-label">Account</div>
+                    <div class="side-row"><span>Access</span><strong>Sign in required</strong></div>
+                    <div class="side-row"><span>History</span><strong>Private per user</strong></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        if user and st.session_state.page == "web":
             st.markdown(
                 """
                 <div class="sidebar-card" style="margin-top:0.9rem;">
@@ -1758,7 +2353,7 @@ def render_sidebar() -> None:
                 unsafe_allow_html=True,
             )
 
-        if st.session_state.page in {"threat", "message", "url"}:
+        if user and st.session_state.page in {"threat", "message", "url"}:
             st.markdown(
                 """
                 <div class="sidebar-card" style="margin-top:0.9rem;">
@@ -1789,6 +2384,131 @@ def render_section_header(kicker: str, title: str, subtitle: str) -> None:
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def set_auth_mode(mode: str) -> None:
+    st.session_state.auth_mode = mode
+    st.session_state.auth_notice = ""
+
+
+def render_auth_gate() -> None:
+    st.markdown("<div style='margin-bottom: 2rem;'></div>", unsafe_allow_html=True)
+    render_section_header(
+        "Secure Portal",
+        "Welcome to HackForge AI",
+        "Sign in to your Firebase account to unlock advanced vulnerability scanners, deep analytics, and your private scan history.",
+    )
+
+    debug_mode = streamlit_secrets().get("DEBUG", False)
+    
+    if debug_mode:
+        setup_warnings = firebase_setup_warnings()
+        if setup_warnings:
+            with st.expander("🛠️ Developer Debug Mode - Firebase Setup", expanded=True):
+                if FIREBASE_IMPORT_ERROR:
+                    st.error(f"Import Error: {FIREBASE_IMPORT_ERROR}")
+                for warning in setup_warnings:
+                    st.warning(warning)
+                st.caption(
+                    "Streamlit Cloud secrets should include firebase_api_key and a Firebase Admin SDK service account."
+                )
+
+    if st.session_state.auth_notice:
+        st.info(st.session_state.auth_notice)
+
+    modes = [
+        ("Login", "login"),
+        ("Signup", "signup"),
+        ("Forgot Password", "forgot"),
+    ]
+    cols = st.columns(3, gap="small")
+    for col, (label, mode) in zip(cols, modes):
+        with col:
+            st.button(
+                label,
+                key=f"auth_mode_{mode}",
+                on_click=set_auth_mode,
+                args=(mode,),
+                use_container_width=True,
+                type="primary" if st.session_state.auth_mode == mode else "secondary",
+            )
+
+    st.write("")
+    mode = st.session_state.auth_mode
+
+    if mode == "signup":
+        with st.form("signup_form"):
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input("Password", type="password", key="signup_password")
+            confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            submitted = st.form_submit_button("Create Account", type="primary", use_container_width=True)
+
+        if submitted:
+            try:
+                if not email.strip():
+                    raise ValueError("Enter your email address.")
+                if len(password) < 6:
+                    raise ValueError("Password must be at least 6 characters.")
+                if password != confirm:
+                    raise ValueError("Passwords do not match.")
+                user = sign_up_with_email_password(email, password)
+                set_auth_user(user)
+                st.session_state.auth_notice = ""
+                clear_scan_state()
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    elif mode == "forgot":
+        with st.form("forgot_password_form"):
+            email = st.text_input("Email", key="forgot_email")
+            submitted = st.form_submit_button("Send Reset Email", type="primary", use_container_width=True)
+
+        if submitted:
+            try:
+                if not email.strip():
+                    raise ValueError("Enter your email address.")
+                send_password_reset(email)
+                st.success("If that account exists, Firebase will send a password reset email.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    else:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
+
+        if submitted:
+            try:
+                if not email.strip():
+                    raise ValueError("Enter your email address.")
+                if not password:
+                    raise ValueError("Enter your password.")
+                user = sign_in_with_email_password(email, password)
+                set_auth_user(user)
+                st.session_state.auth_notice = ""
+                clear_scan_state()
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
+def render_latest_save_status() -> None:
+    if st.session_state.last_firestore_error:
+        st.warning(f"Latest scan is visible, but Firestore save failed: {st.session_state.last_firestore_error}")
+    elif st.session_state.last_saved_scan_id:
+        st.caption(f"Saved to Scan History: {st.session_state.last_saved_scan_id}")
+
+
+def render_report_download(result: Dict[str, Any]) -> None:
+    st.download_button(
+        "Download Text Report",
+        data=build_scan_report_text(result),
+        file_name=report_filename(result),
+        mime="text/plain",
+        use_container_width=True,
     )
 
 
@@ -2277,12 +2997,103 @@ def render_results() -> None:
         "Review the latest website scan or threat check in one clear report.",
     )
 
+    current_result = None
+    if st.session_state.last_result_type == "web" and st.session_state.scan_results:
+        current_result = st.session_state.scan_results
+    elif st.session_state.last_result_type == "threat" and st.session_state.threat_results:
+        current_result = st.session_state.threat_results
+
+    if current_result:
+        render_latest_save_status()
+        render_report_download(current_result)
+        st.write("")
+
     if st.session_state.last_result_type == "web" and st.session_state.scan_results:
         render_web_results(st.session_state.scan_results)
     elif st.session_state.last_result_type == "threat" and st.session_state.threat_results:
         render_threat_results(st.session_state.threat_results)
     else:
         render_empty_results()
+
+
+def render_scan_history() -> None:
+    render_section_header(
+        "Scan History",
+        "Private Scan History",
+        "Review reports saved from completed HackForge AI scans.",
+    )
+
+    user = authenticated_user()
+    if not user:
+        render_auth_gate()
+        return
+
+    toolbar_left, toolbar_right = st.columns([1, 1], gap="small")
+    with toolbar_left:
+        st.button("Refresh History", use_container_width=True)
+    with toolbar_right:
+        st.button("New Web Scan", on_click=navigate, args=("web",), use_container_width=True)
+
+    try:
+        records = load_user_scan_history(user["uid"])
+    except Exception as exc:
+        st.error(f"Could not load scan history: {exc}")
+        return
+
+    if not records:
+        st.markdown(
+            """
+            <div class="empty-state">
+                <h3>No saved scans yet</h3>
+                <p>Complete a website, message, or URL scan and the generated text report will appear here.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    for idx, record in enumerate(records, start=1):
+        artifact = safe_text(record.get("scanned_url_or_content"), "Unavailable")
+        preview = artifact if len(artifact) <= 260 else f"{artifact[:260]}..."
+        report_text = safe_text(record.get("report_text"), "No report text saved.")
+        doc_id = safe_text(record.get("id"), f"scan-{idx}")
+        st.markdown(
+            f"""
+            <div class="finding-card">
+                <div class="finding-head">
+                    <h4>{idx:02d}. {esc(record.get('verdict'))}</h4>
+                    <div class="finding-badges">
+                        <span class="status-pill status-confirmed">{esc(record.get('scan_type'))}</span>
+                    </div>
+                </div>
+                <div class="finding-meta">{esc(format_history_timestamp(record))}</div>
+                <div class="finding-note">{esc(preview)}</div>
+                <div style="height:0.75rem;"></div>
+                <div class="detail-grid">
+                    <div class="detail-tile"><span>Risk Score</span><strong>{esc(record.get('risk_score'))}/100</strong></div>
+                    <div class="detail-tile"><span>Document</span><strong>{esc(doc_id)}</strong></div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(f"View saved report {idx:02d}"):
+            st.text_area(
+                "Saved report text",
+                value=report_text,
+                height=320,
+                key=f"history_report_{doc_id}",
+                label_visibility="collapsed",
+            )
+            st.download_button(
+                "Download Saved Report",
+                data=report_text,
+                file_name=f"hackforge-history-{doc_id}.txt",
+                mime="text/plain",
+                key=f"history_download_{doc_id}",
+                use_container_width=True,
+            )
 
 
 def analytics_source() -> Optional[Dict[str, Any]]:
@@ -2508,12 +3319,15 @@ def render_reference() -> None:
 
 render_sidebar()
 render_topbar()
-render_main_navigation()
+if is_authenticated():
+    render_main_navigation()
 
 st.markdown('<div class="hf-shell">', unsafe_allow_html=True)
 
 current_page = st.session_state.page
-if current_page == "home":
+if not is_authenticated():
+    render_auth_gate()
+elif current_page == "home":
     render_home()
 elif current_page == "web":
     render_web_workspace()
@@ -2527,6 +3341,8 @@ elif current_page == "results":
     render_results()
 elif current_page == "analytics":
     render_analytics()
+elif current_page == "history":
+    render_scan_history()
 elif current_page == "reference":
     render_reference()
 else:

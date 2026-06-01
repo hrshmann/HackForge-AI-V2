@@ -1,5 +1,6 @@
 streamlit
 plotly
+firebase-admin
 aiohttp
 beautifulsoup4
 requests
@@ -12,3 +13,4 @@ nltk==3.8.1
 python-docx
 reportlab
 tldextract
+streamlit-cookies-controller

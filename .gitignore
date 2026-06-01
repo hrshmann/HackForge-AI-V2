@@ -17,3 +17,4 @@ tools/xsstrike/
 
 *.log
 .env
+.streamlit/secrets.toml
